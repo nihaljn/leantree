@@ -159,6 +159,14 @@ def main():
                     avg_cpu = sum(status['cpu_percent_per_core']) / len(status['cpu_percent_per_core'])
                     print(f"CPU: {avg_cpu:.1f}% average across {len(status['cpu_percent_per_core'])} cores")
                     
+                    # Show inactive processes and branches
+                    inactive_proc = status.get('inactive_processes', 0)
+                    total_proc = status.get('total_tracked_processes', 0)
+                    inactive_br = status.get('inactive_branches', 0)
+                    total_br = status.get('total_branches', 0)
+                    print(f"Inactive (>60s): {inactive_proc}/{total_proc} processes, "
+                          f"{inactive_br}/{total_br} branches")
+                    
                     # Show active requests
                     active_requests = status.get('active_requests', [])
                     if active_requests:

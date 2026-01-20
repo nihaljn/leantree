@@ -54,6 +54,10 @@ class LeanServer:
         self._branches: dict[tuple[int, int], LeanProofBranch] = {}
         self._branches_lock = threading.Lock()
         
+        # Last used tracking for inactivity detection
+        self._process_last_used: dict[int, float] = {}  # process_id -> timestamp
+        self._branch_last_used: dict[tuple[int, int], float] = {}  # (process_id, branch_id) -> timestamp
+        
         # Request tracking for monitoring
         self._active_requests: dict[int, dict] = {}  # request_id -> {path, start_time, thread_name}
         self._request_id_counter = 0
@@ -63,11 +67,14 @@ class LeanServer:
         """Get or create a process ID for a LeanProcess."""
         with self._lock:
             if process in self._process_to_id:
-                return self._process_to_id[process]
+                process_id = self._process_to_id[process]
+                self._process_last_used[process_id] = time.time()
+                return process_id
             self._process_id_counter += 1
             process_id = self._process_id_counter
             self._process_to_id[process] = process_id
             self._process_id_to_process[process_id] = process
+            self._process_last_used[process_id] = time.time()
             return process_id
 
     def _get_process(self, process_id: int) -> LeanProcess:
@@ -75,6 +82,7 @@ class LeanServer:
         with self._lock:
             if process_id not in self._process_id_to_process:
                 raise ValueError(f"Process {process_id} not found")
+            self._process_last_used[process_id] = time.time()
             return self._process_id_to_process[process_id]
 
     def _remove_process(self, process_id: int):
@@ -85,6 +93,7 @@ class LeanServer:
                 del self._process_id_to_process[process_id]
                 if process in self._process_to_id:
                     del self._process_to_id[process]
+            self._process_last_used.pop(process_id, None)
         # Also clean up any branches associated with this process
         self._remove_branches_for_process(process_id)
 
@@ -93,7 +102,9 @@ class LeanServer:
         with self._branches_lock:
             self._branch_id_counter += 1
             branch_id = self._branch_id_counter
-            self._branches[(process_id, branch_id)] = branch
+            key = (process_id, branch_id)
+            self._branches[key] = branch
+            self._branch_last_used[key] = time.time()
             return branch_id
 
     def _get_branch(self, process_id: int, branch_id: int) -> LeanProofBranch:
@@ -102,6 +113,7 @@ class LeanServer:
             key = (process_id, branch_id)
             if key not in self._branches:
                 raise ValueError(f"Branch {branch_id} not found for process {process_id}")
+            self._branch_last_used[key] = time.time()
             return self._branches[key]
 
     def _remove_branches_for_process(self, process_id: int):
@@ -110,6 +122,7 @@ class LeanServer:
             keys_to_remove = [k for k in self._branches if k[0] == process_id]
             for key in keys_to_remove:
                 del self._branches[key]
+                self._branch_last_used.pop(key, None)
 
     def _run_async(self, coro, timeout: float | None = None):
         """Run an async coroutine in the event loop.
@@ -268,6 +281,24 @@ class LeanServer:
                     if req["path"] != "/status"
                 ]
                 
+                # Count inactive processes and branches (not used in last 60 seconds)
+                now = time.time()
+                inactive_threshold = 60.0
+                
+                with server._lock:
+                    inactive_processes = sum(
+                        1 for pid, last_used in server._process_last_used.items()
+                        if now - last_used > inactive_threshold
+                    )
+                    total_tracked_processes = len(server._process_last_used)
+                
+                with server._branches_lock:
+                    inactive_branches = sum(
+                        1 for key, last_used in server._branch_last_used.items()
+                        if now - last_used > inactive_threshold
+                    )
+                    total_branches = len(server._branch_last_used)
+                
                 status = {
                     "available_processes": available,
                     "used_processes": used,
@@ -281,6 +312,10 @@ class LeanServer:
                         "used_bytes": memory.used,
                         "percent": memory.percent,
                     },
+                    "inactive_processes": inactive_processes,
+                    "total_tracked_processes": total_tracked_processes,
+                    "inactive_branches": inactive_branches,
+                    "total_branches": total_branches,
                 }
                 self._send_json(200, status)
 

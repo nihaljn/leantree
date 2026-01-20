@@ -183,7 +183,7 @@ class LeanServer:
 
         # Wait for event loop to be ready
         while self._event_loop is None:
-            threading.Event().wait(0.01)
+            time.sleep(0.01)
 
         handler = self._create_handler()
         self.server = ThreadingHTTPServer((self.address, self.port), handler)
@@ -373,6 +373,9 @@ class LeanServer:
                         del server._process_id_to_process[process_id]
                         if process in server._process_to_id:
                             del server._process_to_id[process]
+                        server._process_last_used.pop(process_id, None)
+                    # Clean up any branches associated with this process
+                    server._remove_branches_for_process(process_id)
                     # Now return to pool - any new client will get a fresh ID
                     server._run_async(server.pool.return_process_async(process))
                     self._send_json(200, {"status": "ok"})
@@ -440,7 +443,7 @@ class LeanServer:
 
                     self._send_json(200, {"value": branches_data})
                 except Exception as e:
-                    self._send_json(200, {"error": str(e)})
+                    self._send_error(500, str(e), exception=e)
 
             def _handle_branch_state(self, process_id: int, branch_id: int):
                 try:
@@ -653,7 +656,6 @@ class RemoteLeanProofBranch:
     def try_apply_tactic(
             self,
             tactic: LeanTactic | str,
-            ban_search_tactics: bool = True,
             timeout: int | None = 1000,
     ) -> ValueOrError[list["RemoteLeanProofBranch"]]:
         """Apply a tactic to the proof branch.
@@ -666,7 +668,6 @@ class RemoteLeanProofBranch:
 
         data = {
             "tactic": tactic,
-            "ban_search_tactics": ban_search_tactics,
         }
         if timeout is not None:
             data["timeout"] = timeout
@@ -705,9 +706,6 @@ def start_server(
 
 
 if __name__ == "__main__":
-    from pathlib import Path
-    from leantree.repl_adapter.process_pool import LeanProcessPool
-
     # Example usage
     repl_exe = Path("../lean-repl/.lake/build/bin/repl")
     project_path = Path("../leantree_project")
@@ -723,8 +721,6 @@ if __name__ == "__main__":
     print("Press Ctrl+C to stop")
 
     try:
-        import time
-
         while True:
             time.sleep(1)
     except KeyboardInterrupt:

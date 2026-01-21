@@ -18,13 +18,16 @@ class ShuffleGoalsAndHypotheses:
         self.rng.shuffle(shuffled)
         return goal.with_(hypotheses=shuffled)
 
-    def run(self, node: ProofTreeNode) -> ProofTreeNode:
+    def run_on_goals(self, goals: list[LeanGoal]) -> list[LeanGoal]:
         if self.rng.random() < self.shuffle_prob:
-            shuffled_goals = [self.run_on_goal(goal) for goal in node.state.goals]
+            shuffled_goals = [self.run_on_goal(goal) for goal in goals]
             self.rng.shuffle(shuffled_goals)
-            return node.with_(state=LeanProofState(shuffled_goals))
+            return shuffled_goals
         else:
-            return node
+            return goals
+
+    def run(self, node: ProofTreeNode) -> ProofTreeNode:
+        return node.with_(state=LeanProofState(self.run_on_goals(node.state.goals)))
 
 
 class RandomRename:
@@ -33,9 +36,19 @@ class RandomRename:
         self.rng = random.Random(seed)
 
     def run(self, node: ProofTreeNode) -> ProofTreeNode:
-        node = random_rename_variables(node, rng=self.rng)
-        node = random_rename_goals(node, rng=self.rng)
+        goals, tactic = node.state.goals, node.tactic.tactic.tactic
+
+        goals, tactic = self.run_on_goals(goals, tactic)
+
+        new_lean_tactic = replace(node.tactic.tactic, tactic=tactic)
+        new_edge = replace(node.tactic, tactic=new_lean_tactic)
+        node = node.with_(state=LeanProofState(goals), tactic=new_edge)
         return node
+
+    def run_on_goals(self, goals: list[LeanGoal], tactic: str) -> tuple[list[LeanGoal], str]:
+        goals, tactic = random_rename_variables(goals, tactic, rng=self.rng)
+        goals, tactic = random_rename_goals(goals, tactic, rng=self.rng)
+        return goals, tactic
 
 
 def random_drop_irrelevant_hypotheses(node: ProofTreeNode):
@@ -133,33 +146,25 @@ def _random_rename_variables_in_goal(goal: LeanGoal, rng=random) -> tuple[LeanGo
             
     return goal.with_(hypotheses=current_hypotheses, type=current_goal_type), replacements
 
-def random_rename_variables(node: ProofTreeNode, rng=random) -> ProofTreeNode:
+def random_rename_variables(goals: list[LeanGoal], tactic: str, rng=random) -> tuple[list[LeanGoal], str]:
     new_goals = []
     all_replacements = {}
     
-    for g in node.state.goals:
+    for g in goals:
         new_g, replacements = _random_rename_variables_in_goal(g, rng=rng)
         new_goals.append(new_g)
         for k, v in replacements.items():
             if k not in all_replacements:
                 all_replacements[k] = v
                 
-    new_node = node.with_(state=LeanProofState(new_goals))
-    
-    if node.tactic and node.tactic.tactic:
-        tactic_str = node.tactic.tactic.tactic
-        for old_name, new_name in all_replacements.items():
-            tactic_str = _replace_name(tactic_str, old_name, new_name)
-            
-        new_lean_tactic = replace(node.tactic.tactic, tactic=tactic_str)
-        new_edge = replace(node.tactic, tactic=new_lean_tactic)
-        new_node = new_node.with_(tactic=new_edge)
+    for old_name, new_name in all_replacements.items():
+        tactic = _replace_name(tactic, old_name, new_name)
         
-    return new_node
+    return new_goals, tactic
 
-def random_rename_goals(node: ProofTreeNode, rng=random) -> ProofTreeNode:
+def random_rename_goals(goals: list[LeanGoal], tactic: str, rng=random) -> tuple[list[LeanGoal], str]:
     avoid_names = set()
-    for g in node.state.goals:
+    for g in goals:
         if g.tag:
             avoid_names.add(g.tag)
         for h in g.hypotheses:
@@ -168,9 +173,7 @@ def random_rename_goals(node: ProofTreeNode, rng=random) -> ProofTreeNode:
     new_goals = []
     replacements = {}
     
-    tactic_str = node.tactic.tactic.tactic if node.tactic and node.tactic.tactic else ""
-
-    for g in node.state.goals:
+    for g in goals:
         old_name = g.tag
         length = min(len(old_name), 6) if old_name else rng.randint(1, 5)
         new_name = _generate_random_name(length, avoid_names, rng=rng)
@@ -187,10 +190,9 @@ def random_rename_goals(node: ProofTreeNode, rng=random) -> ProofTreeNode:
             used_in_type = (new_type != g.type)
             
             used_in_tactic = False
-            if tactic_str:
-                # Check if replacing would change the tactic string
-                if _replace_name(tactic_str, old_name, new_name) != tactic_str:
-                    used_in_tactic = True
+            # Check if replacing would change the tactic string
+            if _replace_name(tactic, old_name, new_name) != tactic:
+                used_in_tactic = True
             
             if used_in_type or used_in_tactic:
                 if rng.random() < 0.5:
@@ -211,17 +213,11 @@ def random_rename_goals(node: ProofTreeNode, rng=random) -> ProofTreeNode:
             
         new_goals.append(updated_goal)
         
-    new_node = node.with_(state=LeanProofState(new_goals))
-    
-    if replacements and tactic_str:
+    if replacements and tactic:
         for old_name, new_name in replacements.items():
-            tactic_str = _replace_name(tactic_str, old_name, new_name)
+            tactic = _replace_name(tactic, old_name, new_name)
             
-        new_lean_tactic = replace(node.tactic.tactic, tactic=tactic_str)
-        new_edge = replace(node.tactic, tactic=new_lean_tactic)
-        new_node = new_node.with_(tactic=new_edge)
-
-    return new_node
+    return new_goals, tactic
 
 
 # TODO: there should be a column for source (mathlib/DeepSeekProver)

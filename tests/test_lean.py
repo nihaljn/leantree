@@ -23,10 +23,16 @@ to𝕜 : (E →L[ℝ] ℝ) → E →L[𝕜] 𝕜 := fun fr =>
   let __LinearMap := (↑fr).extendTo𝕜';
   { toLinearMap := __LinearMap, cont := ⋯ }"""
 
+    EXAMPLE_WITH_UNINDENTED_CONTINUATION = """\
+this : _root_.Monad (ofTypeMonad m).obj := let_fun this := inferInstance;
+this
+"""
+
     @pytest.mark.parametrize("hypothesis_str", [
         EXAMPLE_SIMPLE,
         EXAMPLE_MULTILINE,
         EXAMPLE_WITH_VALUE,
+        EXAMPLE_WITH_UNINDENTED_CONTINUATION,
     ])
     def test_from_string_str_roundtrip(self, hypothesis_str: str):
         """Test that parsing and re-stringifying is idempotent after one pass."""

@@ -140,8 +140,8 @@ class LeanGoal(ProofGoal):
         curr_hypothesis = ""
         hypotheses = []
         for line in [line for line in hypotheses_str.splitlines() if len(line.strip()) != 0]:
-            # We use the fact that subsequent lines of the same hypothesis are indented.
-            if curr_hypothesis and line[0] != " ":
+            # Indented line means continuation of the hypothesis. So does a line without ":" (mostly).
+            if curr_hypothesis and (line[0] != " " and ":" in line):
                 hypotheses.extend(LeanHypothesis.from_string(curr_hypothesis))
                 curr_hypothesis = ""
             curr_hypothesis += line

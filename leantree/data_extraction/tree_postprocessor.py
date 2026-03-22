@@ -2,13 +2,13 @@ import re
 
 import leantree.utils
 from leantree.repl_adapter.data import SingletonProofTree, SingletonProofTreeNode, SingletonProofTreeEdge
-from leantree.file_span import FileSpan
+from leantree.file_span import FileSpan, FilePosition
 from leantree.repl_adapter.ast_parser import LeanASTObject, LeanASTArray
 
 
 class ProofTreePostprocessor:
     @classmethod
-    def transform_proof_tree(cls, tree: SingletonProofTree):
+    def transform_proof_tree(cls, tree: SingletonProofTree, source_text: str | None = None):
         def visitor(node: SingletonProofTreeNode):
             assert node.tactic is not None, "Transforming an unsolved node."
             if node.tactic.is_synthetic():
@@ -16,8 +16,9 @@ class ProofTreePostprocessor:
 
             # Note: the order is important here, because tacticStrings are being modified.
             cls._replace_nested_tactics_with_sorries(node)
+            cls._decompose_unresolved_nested_by(node)
             cls._remove_by_sorry_in_have(node)
-            cls._transform_with_cases(node)
+            cls._transform_with_cases(node, source_text)
             cls._transform_case_tactic(node)
             cls._transform_simp_rw(node)
             cls._transform_rw(node)
@@ -26,7 +27,71 @@ class ProofTreePostprocessor:
                 node.tactic.tactic_string
             ))
 
+        cls._merge_intro_arguments(tree)
         cls._add_missing_assumption_tactics(tree)
+        cls._fix_incomplete_using_clause(tree, source_text)
+        tree.traverse_preorder(visitor)
+
+    # Tactic keywords that match the bare identifier regex but should NOT be merged into `intro`.
+    # These are single-word tactics that could appear as the next step after `intro`.
+    _TACTIC_KEYWORDS = frozenset({
+        "omega", "rfl", "assumption", "trivial", "contradiction", "simp", "ring",
+        "norm_num", "linarith", "decide", "exact", "apply", "constructor", "rw",
+        "cases", "induction", "intro", "intros", "refl", "ext", "funext", "congr",
+        "norm_cast", "push_cast", "aesop", "tauto", "Abel", "group", "positivity",
+        "polyrith", "field_simp", "ring_nf", "simp_all", "grind", "gcongr",
+        "refine", "have", "let", "obtain", "rcases", "suffices", "show",
+        "specialize", "revert", "clear", "rename", "subst", "left", "right",
+        "exfalso", "absurd", "push_neg", "by_contra", "by_cases",
+        "use", "existsi", "inhabit", "choose", "lift",
+    })
+
+    @classmethod
+    def _merge_intro_arguments(cls, tree: SingletonProofTree):
+        """Merge bare identifier tactic steps that follow `intro` into a single `intro` tactic.
+
+        In newer Lean versions, the REPL splits `intro n h1` into two proof steps:
+        one for `intro n` and one for `h1`. This method detects and merges them.
+        """
+        def visitor(node: SingletonProofTreeNode):
+            if node.tactic is None:
+                return
+            tactic_str = node.tactic.tactic_string.strip()
+            if not tactic_str.startswith("intro"):
+                return
+            # Check if the single child is a bare identifier (continuation of intro)
+            children = node.tactic.goals_after
+            while (
+                len(children) == 1
+                and len(node.tactic.spawned_goals) == 0
+                and children[0].tactic is not None
+                and not children[0].tactic.is_synthetic()
+            ):
+                child = children[0]
+                child_tactic = leantree.utils.remove_empty_lines(
+                    leantree.utils.remove_comments(child.tactic.tactic_string)
+                ).strip()
+                # A bare identifier that is NOT a known tactic keyword
+                if (re.match(r'^[a-zA-Z_]\w*$', child_tactic)
+                        and child_tactic not in cls._TACTIC_KEYWORDS):
+                    # Merge: append the identifier to the intro tactic
+                    node.tactic.tactic_string = tactic_str + " " + child_tactic
+                    tactic_str = node.tactic.tactic_string.strip()
+                    # Extend span to cover the merged child
+                    if node.tactic.span is not None and child.tactic.span is not None:
+                        node.tactic.span = FileSpan(
+                            node.tactic.span.start,
+                            child.tactic.span.finish,
+                        )
+                    # Adopt grandchildren
+                    node.tactic.goals_after = child.tactic.goals_after
+                    node.tactic.spawned_goals = child.tactic.spawned_goals
+                    for grandchild in child.tactic.all_children():
+                        grandchild.parent = node
+                    children = node.tactic.goals_after
+                else:
+                    break
+
         tree.traverse_preorder(visitor)
 
     @classmethod
@@ -49,17 +114,57 @@ class ProofTreePostprocessor:
 
         tree.traverse_preorder(visitor)
 
+    @classmethod
+    def _fix_incomplete_using_clause(cls, tree: SingletonProofTree, source_text: str | None = None):
+        """Fix tactic strings ending with `using` that are missing their argument.
+
+        In Lean 4.29, the REPL sometimes splits `simpa [...] using <term>` into two steps:
+        the `simpa [...] using` part (with a span that ends before the term) and a separate
+        child node for the term. This produces an invalid tactic like `simpa [...] using `
+        that the REPL rejects. Fix by reading the missing argument from the source text
+        and appending it.
+        """
+        if source_text is None:
+            return
+
+        def visitor(node: SingletonProofTreeNode):
+            if node.tactic is None or node.tactic.is_synthetic():
+                return
+            ts = node.tactic.tactic_string.rstrip()
+            if not ts.endswith('using'):
+                return
+            # The tactic ends with `using` but no argument follows.
+            # Read the argument from the source text after the span.
+            if node.tactic.span is None:
+                return
+            span_end = node.tactic.span.finish.offset
+            # Find the argument: skip whitespace after span, then read the identifier/term
+            rest = source_text[span_end:]
+            stripped = rest.lstrip(' ')
+            if not stripped or stripped[0] == '\n':
+                return
+            # Read until whitespace or newline
+            arg = ''
+            for ch in stripped:
+                if ch in ' \t\n\r':
+                    break
+                arg += ch
+            if arg:
+                node.tactic.tactic_string = ts + ' ' + arg
+
+        tree.traverse_preorder(visitor)
+
     # https://lean-lang.org/doc/reference/latest//Tactic-Proofs/Tactic-Reference/#cases
     @classmethod
-    def _transform_with_cases(cls, node: SingletonProofTreeNode):
+    def _transform_with_cases(cls, node: SingletonProofTreeNode, source_text: str | None = None):
         tactic_str = node.tactic.tactic_string
         cases_match = re.search(r"^(cases\s+[^\n]+)with\s+", tactic_str)
         induction_match = re.search(r"^(induction\s+[^\n]+)with\s+", tactic_str)
         if cases_match:
-            constructors = cls._extract_cases_constructors(node)
+            constructors = cls._extract_cases_constructors(node, source_text)
             match = cases_match
         elif induction_match:
-            constructors = cls._extract_induction_constructors(node)
+            constructors = cls._extract_induction_constructors(node, source_text)
             match = induction_match
         else:
             return
@@ -120,8 +225,18 @@ class ProofTreePostprocessor:
         # By blocks are also in any number of other places, like `exact sum_congr rfl fun x _ ↦ by ac_rfl`.
         sub_spans = []
         for ancestor in ancestors:
+            if ancestor.tactic is None:
+                continue
             if not ancestor.tactic.is_synthetic() and node.tactic.span.contains(ancestor.tactic.span):
                 sub_spans.append(ancestor.tactic.span.relative_to(node.tactic.span.start))
+
+        # Extend sub_spans to cover trailing content that belongs to the same tactic
+        # but isn't covered by the REPL's reported span. This happens when tactic arguments
+        # (e.g. `hpd3` in `simpa [...] using hpd3`) are separate tree nodes with synthetic
+        # spans that don't contribute to sub_spans.
+        if sub_spans:
+            sub_spans = cls._extend_spans_for_trailing_content(sub_spans, node.tactic.tactic_string)
+
         if sub_spans:
             sub_spans = FileSpan.merge_contiguous_spans(
                 sub_spans,
@@ -135,86 +250,208 @@ class ProofTreePostprocessor:
             )
             node.tactic.tactic_string = new_tactic
 
+    # Pattern to find `by <tactic>` in a tactic string that wasn't decomposed.
+    # The REPL normally decomposes nested `by` blocks into separate proof steps,
+    # but when the nested tactic has an error Lean doesn't report it.
+    _NESTED_BY_RE = re.compile(
+        r'\bby\s+'           # `by` keyword followed by whitespace
+        r'(?!sorry\b)'       # NOT followed by `sorry` (already decomposed)
+        r'(.+)'              # the nested tactic text (greedy — take everything)
+    )
+
     @classmethod
-    def _remove_by_sorry_in_have(cls, node: SingletonProofTreeNode):
-        match = re.match(r"(have[ \t]+[^\n]+?)[ \t]+:=[ \t]+by[ \t\n]+sorry", node.tactic.tactic_string)
-        if not match:
-            return
-        if len(node.tactic.spawned_goals) != 1:
+    def _decompose_unresolved_nested_by(cls, node: SingletonProofTreeNode):
+        """Detect `by <tactic>` in a tactic string that wasn't decomposed by the
+        REPL (typically because the nested tactic errored).  Replace with
+        `by sorry` and create a synthetic spawned-goal child so the tree builder
+        will replay it separately, producing the correct two-branch structure."""
+        tactic_str = node.tactic.tactic_string
+
+        # Only process tactics that still have a non-sorry `by` block
+        m = cls._NESTED_BY_RE.search(tactic_str)
+        if m is None:
             return
 
-        node.tactic.tactic_string = match.group(1)
-        node.tactic.goals_after.insert(0, node.tactic.spawned_goals[0])
-        node.tactic.spawned_goals = []
+        nested_tactic = m.group(1).strip()
+        if not nested_tactic:
+            return
+
+        # Check if there are already spawned_goals that cover this —
+        # if so, _replace_nested_tactics_with_sorries already handled it.
+        if node.tactic.spawned_goals:
+            return
+
+        # Replace `by <tactic>` with `by sorry`
+        by_start = m.start()
+        node.tactic.tactic_string = tactic_str[:by_start] + "by sorry"
+
+        # Create a synthetic child node for the nested tactic.  During replay
+        # the tree builder will send `by sorry` and get the sub-goal back, then
+        # try the nested tactic on that sub-goal.
+        child_edge = SingletonProofTreeEdge.create_synthetic(
+            tactic_string=nested_tactic,
+            goal_before=None,
+            spawned_goals=[],
+            goals_after=[],
+        )
+        child_node = SingletonProofTreeNode.create_synthetic(parent=node, tactic=child_edge)
+        node.tactic.spawned_goals.append(child_node)
+
+    # Closing delimiters that belong to a parent expression, not the nested tactic.
+    # The span extension must stop before these characters.
+    _CLOSING_DELIMITERS = set(')}]⟩»')
+
+    @classmethod
+    def _extend_spans_for_trailing_content(cls, sub_spans: list[FileSpan], tactic_string: str) -> list[FileSpan]:
+        """Extend sub_spans to cover trailing content up to the next sub_span boundary.
+
+        When the REPL reports a tactic span that doesn't include trailing arguments
+        or continuation lines (e.g. `simpa [...] using` without `hpd3`, or
+        `induction h with` without `| refl => ...`), the uncovered text survives
+        sorry-replacement. This extends each sub_span to the boundary of the next
+        sub_span (or end of tactic string), consuming any trailing content that
+        would otherwise be left as dangling text after `sorry`.
+
+        However, closing delimiters like `)`, `⟩`, `]` belong to the parent
+        expression and must not be consumed.
+        """
+        result = []
+        sorted_spans = sorted(sub_spans, key=lambda s: s.start)
+        for i, span in enumerate(sorted_spans):
+            # Find the end boundary: either the start of the next span or end of string
+            if i + 1 < len(sorted_spans):
+                boundary = sorted_spans[i + 1].start.offset
+            else:
+                boundary = len(tactic_string)
+            # Check if there's non-whitespace content between this span's end and boundary
+            trailing = tactic_string[span.finish.offset:boundary]
+            stripped = trailing.strip()
+            if stripped and stripped[0] not in cls._CLOSING_DELIMITERS:
+                # Extend to cover trailing tactic arguments, but stop before any
+                # closing delimiter that belongs to the parent expression.
+                extend_to = boundary
+                for j in range(span.finish.offset, boundary):
+                    if tactic_string[j] in cls._CLOSING_DELIMITERS:
+                        extend_to = j
+                        break
+                if extend_to > span.finish.offset:
+                    result.append(FileSpan(span.start, FilePosition(extend_to)))
+                else:
+                    result.append(span)
+            else:
+                result.append(span)
+        return result
+
+    @classmethod
+    def _remove_by_sorry_in_have(cls, node: SingletonProofTreeNode):
+        # In newer Lean versions, stripping `:= by sorry` from `have` can cause parse errors
+        # (e.g. when custom notation like `n !` is involved). Keep the full tactic string.
+        pass
+
+    @classmethod
+    def _extract_constructors_from_ast(cls, node: SingletonProofTreeNode, keyword: str) -> list[str] | None:
+        """Try to extract constructor names from AST (works for Lean <4.29).
+
+        Returns None if the AST structure doesn't match expectations.
+        """
+        try:
+            ast_node = node.tactic.ast.root
+            expected_args = 4 if keyword == "cases" else 5
+            assert isinstance(ast_node, LeanASTObject) and len(ast_node.args) == expected_args
+            alts_array = ast_node.args[expected_args - 1]
+            assert isinstance(alts_array, LeanASTArray) and len(alts_array.items) == 1
+            alts_node = alts_array.items[0]
+            assert (
+                isinstance(alts_node, LeanASTObject) and
+                alts_node.type == "Tactic.inductionAlts" and
+                len(alts_node.args) == 3
+            )
+            alts = alts_node.args[2]
+            assert isinstance(alts, LeanASTArray)
+
+            constructors = []
+            for alt in alts.items:
+                assert isinstance(alt, LeanASTObject) and alt.type == "Tactic.inductionAlt"
+                constructor_tokens = alt.args[0].get_tokens()
+                assert constructor_tokens[0] == "|"
+                constructor = " ".join(constructor_tokens[1:])
+                constructors.append(constructor)
+            return constructors
+        except (AssertionError, AttributeError, IndexError):
+            return None
+
+    @classmethod
+    def _extract_constructors_from_source(cls, node: SingletonProofTreeNode, source_text: str) -> list[str] | None:
+        """Extract constructor names and binder names from source file text.
+
+        In Lean 4.29+, the AST for induction/cases no longer contains the inductionAlts.
+        Instead, we read the source file and parse `| constructor binders... =>` patterns
+        that follow the `with` keyword.
+        """
+        if node.tactic.span is None:
+            return None
+
+        # Read source text from after the tactic span (the `with` keyword) to find alternatives.
+        # The tactic span covers just the header (e.g., `cases q with`).
+        # The alternatives follow on subsequent lines.
+        after_with = source_text[node.tactic.span.finish.offset:]
+
+        # Find all `| constructor_name [binders...] =>` patterns
+        # This regex matches: | <words separated by spaces> =>
+        alt_pattern = re.compile(r'\|\s*(.+?)\s*=>')
+        matches = alt_pattern.findall(after_with)
+
+        if not matches:
+            return None
+
+        # Only take as many matches as there are spawned goals
+        num_goals = len(node.tactic.spawned_goals)
+        if len(matches) < num_goals:
+            return None
+
+        # Strip `@` prefix from constructor names — `| @tail j k _ hjk ih =>` uses
+        # explicit matching in `induction`/`cases` with `with`, but the `case` tactic
+        # doesn't support the `@` prefix.
+        result = [m.lstrip('@').lstrip() for m in matches[:num_goals]]
+        return result
+
+    @classmethod
+    def _extract_constructors_from_goal_tags(cls, node: SingletonProofTreeNode) -> list[str]:
+        """Last-resort fallback: extract just constructor names from spawned goal tags.
+
+        This doesn't include binder names, so variable renaming won't happen.
+        Only use when source text and AST are both unavailable.
+        """
+        constructors = []
+        for spawned in node.tactic.spawned_goals:
+            tag = spawned.goal.tag if spawned.goal else None
+            if not tag:
+                tag = "anonymous"
+            constructors.append(tag)
+        return constructors
 
     # TODO: deduplicate?
     @classmethod
-    def _extract_cases_constructors(cls, node: SingletonProofTreeNode) -> list[str]:
-        ast_node = node.tactic.ast.root
-        assert (
-                isinstance(ast_node, LeanASTObject) and
-                len(ast_node.args) == 4 and
-                ast_node.args[0].pretty_print() == "cases"
-        )
-        alts_array = ast_node.args[3]
-        assert isinstance(alts_array, LeanASTArray) and len(alts_array.items) == 1
-        alts_node = alts_array.items[0]
-        assert (
-                isinstance(alts_node, LeanASTObject) and
-                alts_node.type == "Tactic.inductionAlts" and
-                len(alts_node.args) == 3 and
-                alts_node.args[0].pretty_print() == "with"
-        )
-        alts = alts_node.args[2]
-        assert isinstance(alts, LeanASTArray)
-
-        constructors = []
-        for alt in alts.items:
-            assert (
-                    isinstance(alt, LeanASTObject) and
-                    alt.type == "Tactic.inductionAlt" and
-                    len(alt.args) == 3 and
-                    alt.args[1].pretty_print() == "=>"
-            )
-            constructor_tokens = alt.args[0].get_tokens()
-            assert constructor_tokens[0] == "|"
-            constructor = " ".join(constructor_tokens[1:])
-            constructors.append(constructor)
-        return constructors
+    def _extract_cases_constructors(cls, node: SingletonProofTreeNode, source_text: str | None = None) -> list[str]:
+        result = cls._extract_constructors_from_ast(node, "cases")
+        if result is not None:
+            return result
+        if source_text is not None:
+            result = cls._extract_constructors_from_source(node, source_text)
+            if result is not None:
+                return result
+        return cls._extract_constructors_from_goal_tags(node)
 
     @classmethod
-    def _extract_induction_constructors(cls, node: SingletonProofTreeNode) -> list[str]:
-        ast_node = node.tactic.ast.root
-        assert (
-                isinstance(ast_node, LeanASTObject) and
-                len(ast_node.args) == 5 and
-                ast_node.args[0].pretty_print() == "induction"
-        )
-        alts_array = ast_node.args[4]
-        assert isinstance(alts_array, LeanASTArray) and len(alts_array.items) == 1
-        alts_node = alts_array.items[0]
-        assert (
-                isinstance(alts_node, LeanASTObject) and
-                alts_node.type == "Tactic.inductionAlts" and
-                len(alts_node.args) == 3 and
-                alts_node.args[0].pretty_print() == "with"
-        )
-        alts = alts_node.args[2]
-        assert isinstance(alts, LeanASTArray)
-
-        constructors = []
-        for alt in alts.items:
-            assert (
-                    isinstance(alt, LeanASTObject) and
-                    alt.type == "Tactic.inductionAlt" and
-                    len(alt.args) == 3 and
-                    alt.args[1].pretty_print() == "=>"
-            )
-            constructor_tokens = alt.args[0].get_tokens()
-            assert constructor_tokens[0] == "|"
-            constructor = " ".join(constructor_tokens[1:])
-            constructors.append(constructor)
-        return constructors
+    def _extract_induction_constructors(cls, node: SingletonProofTreeNode, source_text: str | None = None) -> list[str]:
+        result = cls._extract_constructors_from_ast(node, "induction")
+        if result is not None:
+            return result
+        if source_text is not None:
+            result = cls._extract_constructors_from_source(node, source_text)
+            if result is not None:
+                return result
+        return cls._extract_constructors_from_goal_tags(node)
 
     @classmethod
     def _transform_simp_rw(cls, node: SingletonProofTreeNode):

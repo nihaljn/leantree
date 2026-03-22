@@ -157,10 +157,15 @@ def to_sync(func):
             loop_created = True
 
         if loop.is_running():
-            raise RuntimeError(
-                "Called a synchronous function from within a running event loop."
-                "Use the async version of the function instead (called `..._async`)."
-            )
+            try:
+                import nest_asyncio
+                nest_asyncio.apply(loop)
+            except ImportError:
+                raise RuntimeError(
+                    "Called a synchronous function from within a running event loop."
+                    "Use the async version of the function instead (called `..._async`)."
+                    " Or install nest_asyncio: pip install nest_asyncio"
+                )
 
         try:
             return loop.run_until_complete(func(*args, **kwargs))

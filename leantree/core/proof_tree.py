@@ -15,13 +15,16 @@ class ProofTreeEdge:
     parent: "ProofTreeNode"
     children: "list[ProofTreeNode]"
     tactic_depends_on: list[str] | None = None
+    # Error messages from REPL sorry-recovery: the tactic had errors (e.g.
+    # unknown constant) but Lean still produced goals via sorry substitution.
+    error: str | None = None
 
     def is_synthetic(self) -> bool:
         return self.span is None
 
     # TODO: the decision what to serialize should be in the dataset generator, not here
     def serialize(self) -> dict:
-        return {
+        result = {
             "tactic_string": self.tactic.tactic,
             "span": self.span.serialize() if self.span is not None else None,
             "parent": self.parent.id,
@@ -29,6 +32,9 @@ class ProofTreeEdge:
             # Enables e.g. data augmentation of removing irrelevant hypotheses.
             "tactic_depends_on": self.tactic_depends_on,
         }
+        if self.error is not None:
+            result["error"] = self.error
+        return result
 
     @classmethod
     def deserialize(cls, data: dict, all_nodes: "dict[str, ProofTreeNode]") -> "ProofTreeEdge":
@@ -38,6 +44,7 @@ class ProofTreeEdge:
             parent=all_nodes[data["parent"]],
             children=[all_nodes[node_id] for node_id in data["children"]],
             tactic_depends_on=data["tactic_depends_on"],
+            error=data.get("error"),
         )
 
     def with_(self, **changes):
@@ -53,6 +60,9 @@ class ProofTreeNode:
     # TODO: rename to edge
     tactic: ProofTreeEdge | None = None
     parent: Self | None = None
+    # Error message if tactic replay failed at this node. The node retains its
+    # goal state so the caller can see *what* was being proved when it broke.
+    error: str | None = None
 
     def __hash__(self):
         return self.id.__hash__()
@@ -107,15 +117,29 @@ class ProofTreeNode:
         return nodes
 
     def is_solved(self) -> bool:
-        return self.tactic is not None and all(
-            child.is_solved() for child in self.tactic.children
-        )
+        if self.error is not None or self.tactic is None:
+            return False
+        if self.tactic.error is not None:
+            return False
+        return all(child.is_solved() for child in self.tactic.children)
+
+    def has_error(self) -> bool:
+        """Check if this node, its edge, or any descendant has an error."""
+        if self.error is not None:
+            return True
+        if self.tactic is None:
+            return False
+        if self.tactic.error is not None:
+            return True
+        return any(child.has_error() for child in self.tactic.children)
 
     def serialize(self) -> dict:
         data = {
             "id": self.id,
             "state": self.state.serialize()
         }
+        if self.error is not None:
+            data["error"] = self.error
         if self.tactic is not None:
             data = {
                 **data,
@@ -131,7 +155,8 @@ class ProofTreeNode:
     ) -> Self:
         result = ProofTreeNode(
             id=data["id"],
-            state= LeanProofState.deserialize(data["state"]),
+            state=LeanProofState.deserialize(data["state"]),
+            error=data.get("error"),
         )
         if including_edges:
             result.deserialize_edges(data, all_nodes)
@@ -153,6 +178,10 @@ class ProofTree:
 
     def is_solved(self) -> bool:
         return self.root.is_solved()
+
+    def has_error(self) -> bool:
+        """Check if any node in the tree has an error."""
+        return self.root.has_error()
 
     def serialize(self) -> dict:
         return {
@@ -185,7 +214,8 @@ class ProofTree:
                 return node.children
             assert isinstance(node, ProofTreeNode)
             if node.tactic is None:
-                return [IntermediateNode(None, [])]
+                # Leaf node — either unexpanded or an error terminal
+                return []
             children = node.tactic.children
             if len(children) == 1:
                 return children
@@ -199,21 +229,29 @@ class ProofTree:
             assert isinstance(node, ProofTreeNode)
             descriptor = node.id + "\n" + "\n".join(
                 f"{goal.tag + ": " if goal.tag else ""}{goal.type}" for goal in node.state.goals
-            )
+            ) if node.state and node.state.goals else node.id
+            if node.error is not None:
+                return f"ERROR: {node.error}\n{descriptor}"
             if node.is_solved():
                 return f"({node.proof_size}) {descriptor}"
             return descriptor
+
+        def _edge_label_with_error(edge: ProofTreeEdge) -> str:
+            label = edge.tactic.tactic
+            if edge.error is not None:
+                label += f"  ERROR: {edge.error}"
+            return label
 
         def get_edge_label(node: ProofTreeNode | IntermediateNode):
             if isinstance(node, IntermediateNode):
                 if node.tactic is None:
                     return None
-                return node.tactic.tactic.tactic
+                return _edge_label_with_error(node.tactic)
             assert isinstance(node, ProofTreeNode)
             if node.parent is None:
                 return None
             if len(node.parent.tactic.children) > 1:
                 return None
-            return node.parent.tactic.tactic.tactic
+            return _edge_label_with_error(node.parent.tactic)
 
         return utils.pretty_print_tree(self.root, get_children, get_node_label, get_edge_label)

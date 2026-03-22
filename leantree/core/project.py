@@ -70,6 +70,7 @@ class LeanProject:
         assert str(path).endswith(".lean")
 
         loaded_file = LeanFileParser.load_lean_file(self.repl_path, self.path, path, use_cache)
+        source_text = path.read_text(encoding="utf-8")
         for unit in loaded_file.units:
             if len(unit.proof_steps) == 0:
                 continue
@@ -77,7 +78,7 @@ class LeanProject:
             try:
                 unit.trees = SingletonTreeBuilder.build_singleton_trees(unit)
                 for tree in unit.trees:
-                    ProofTreePostprocessor.transform_proof_tree(tree)
+                    ProofTreePostprocessor.transform_proof_tree(tree, source_text)
             except (AssertionError, LeanInteractionException) as e:
                 traceback.print_exc()
                 if store_assertion_errors:

@@ -7,7 +7,7 @@ from leantree.core.proof_tree import ProofTree, ProofTreeNode, ProofTreeEdge
 from leantree.file_span import FilePosition
 from leantree.repl_adapter.data import ReplLoadedLeanFile, SingletonProofTree, SingletonProofTreeNode, \
     ReplCompilationUnit
-from leantree.repl_adapter.interaction import LeanProofBranch, LeanProcess
+from leantree.repl_adapter.interaction import LeanProofBranch, LeanProcess, LeanInteractionException
 from leantree.utils import get_source_with_sorries, replace_with_sorries
 
 
@@ -134,7 +134,52 @@ class ProofTreeBuilder:
                 # Here we could do rotate_left or pick_goal.
                 raise AssertionError("Applying tactic to a non-main unnamed goal is not yet supported.")
 
-            sub_branches = branch.apply_tactic(tactic)
+            # Treat `sorry` as an error — it means the proof is incomplete.
+            if tactic_info.tactic_string.strip() == "sorry":
+                error_msg = "sorry: proof incomplete"
+                error_child = ProofTreeNode.from_state(LeanProofState([]))
+                error_child.error = error_msg
+                node.set_tactic(ProofTreeEdge(
+                    tactic=LeanTactic(tactic),
+                    span=tactic_info.span,
+                    parent=node,
+                    children=[error_child],
+                    tactic_depends_on=tactic_info.tactic_depends_on,
+                    error=error_msg,
+                ))
+                solved_nodes.add(expansion_node.id)
+                continue
+
+            try:
+                sub_branches = branch.apply_tactic(tactic)
+            except (AssertionError, LeanInteractionException) as e:
+                # Tactic truly failed (no goals returned) — create edge with
+                # a synthetic error child as a terminal leaf.
+                error_child = ProofTreeNode.from_state(LeanProofState([]))
+                error_child.error = str(e)
+                node.set_tactic(ProofTreeEdge(
+                    tactic=LeanTactic(tactic),
+                    span=tactic_info.span,
+                    parent=node,
+                    children=[error_child],
+                    tactic_depends_on=tactic_info.tactic_depends_on,
+                    error=str(e),
+                ))
+                solved_nodes.add(expansion_node.id)
+                continue
+
+            # Check if the REPL returned error messages alongside valid goals
+            # (sorry-recovery). Collect them for the edge annotation.
+            edge_error = None
+            for sb in sub_branches:
+                if sb.error_messages:
+                    edge_error = "; ".join(m["data"] for m in sb.error_messages)
+                    break
+            # When the tactic returned no goals (sorry closed everything) but
+            # had error messages, the calling branch stores them.
+            if edge_error is None and branch.error_messages:
+                edge_error = "; ".join(m["data"] for m in branch.error_messages)
+                branch.error_messages = None  # consumed
 
             src_siblings = [src_nodes[i] for i in range(len(src_nodes)) if i != expansion_idx]
             # Note that the order here is important and reflects behavior of the REPL.
@@ -179,6 +224,7 @@ class ProofTreeBuilder:
                 parent=node,
                 children=children,
                 tactic_depends_on=tactic_info.tactic_depends_on,
+                error=edge_error,
             ))
             # TODO: look into this error
             # assert len(src_all_children) == 0, \

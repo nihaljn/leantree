@@ -243,7 +243,13 @@ class LeanProcess:
         # TODO: handle warnings
         warnings = [m for m in messages if m["severity"] == "warning" and m["data"] != "declaration uses 'sorry'"]
         if len(errors) > 0:
-            raise LeanInteractionException(f"REPL returned error messages: {json.dumps(errors, ensure_ascii=False)}")
+            # If the response also has valid goals, the REPL used sorry-recovery.
+            # Store the errors in the response for downstream annotation instead
+            # of aborting — this lets the tree builder continue past the error.
+            if "goals" in response:
+                response["_error_messages"] = errors
+            else:
+                raise LeanInteractionException(f"REPL returned error messages: {json.dumps(errors, ensure_ascii=False)}")
 
         message = response.get("message")
         if message == "Operation timed out":
@@ -568,6 +574,10 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
         self._proof_state_id = proof_state_id
         self._all_goals = all_goals if isinstance(all_goals, list) else [all_goals]
         self._goals_mask = goals_mask
+        # Error messages from REPL sorry-recovery (tactic had errors but still
+        # produced goals). Set by apply_tactic_async when the REPL response
+        # contains error messages alongside valid goals.
+        self.error_messages: list[dict] | None = None
         assert self._goals_mask is None or len(self._all_goals) == len(self._goals_mask)
 
     def __str__(self):
@@ -689,6 +699,19 @@ class LeanProofBranch(ProofBranch[LeanGoal, LeanTactic]):
             for goal in next_state.state.goals:
                 if goal.type.startswith("?") and " " not in goal.type:
                     raise LeanInteractionException("Metavariable-only goal types are not allowed.")
+
+        # Propagate error messages from sorry-recovery to all branches so the
+        # tree builder can annotate the corresponding edge.
+        error_msgs = response.get("_error_messages")
+        if error_msgs:
+            if next_states:
+                for state in next_states:
+                    state.error_messages = error_msgs
+            else:
+                # Tactic returned no goals (sorry closed everything) but had
+                # errors.  Store on the calling branch so tree_builder can
+                # pick them up even when sub_branches is empty.
+                self.error_messages = error_msgs
 
         return next_states
 

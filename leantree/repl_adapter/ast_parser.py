@@ -119,7 +119,7 @@ class LeanAST:
             i = start_idx
             # Addresses arguments like «term(↑)»
             depths = {b: 0 for b in ["«»"]}
-            while not (s[i] in [*string.whitespace, *")]"] and all(d == 0 for d in depths.values())):
+            while i < len(s) and not (s[i] in [*string.whitespace, *")]"] and all(d == 0 for d in depths.values())):
                 for b in depths:
                     if s[i] == b[0]:
                         depths[b] += 1
@@ -169,8 +169,11 @@ class LeanAST:
 
         s = s.strip()
         root, final_idx = read_node(0)
-        assert isinstance(root, LeanASTNode)
         assert final_idx == len(s)
+        if isinstance(root, LeanASTLiteral):
+            # Bare identifiers like `h1 — wrap in a synthetic node
+            root = LeanASTObject(root.value, [])
+        assert isinstance(root, LeanASTNode)
         return LeanAST(root)
 
 

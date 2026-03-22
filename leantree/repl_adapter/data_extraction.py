@@ -107,14 +107,18 @@ class LeanFileParser:
             if not is_empty_line_error:
                 raise RuntimeError(f"Command failed: {result.stderr}")
 
-        repl_data = json.loads(result.stdout)
+        # The REPL may output multiple JSON objects (e.g. an error for trailing newlines).
+        # Only parse the first one.
+        decoder = json.JSONDecoder()
+        repl_data, _ = decoder.raw_decode(result.stdout)
 
         if "message" in repl_data:
             raise Exception(f"lean-repl returned an error: {repl_data["message"]}")
 
         assert len(repl_data["proofTreeEdges"]) == len(repl_data["infotree"])
-        if any(msg["severity"] == "error" for msg in repl_data.get("messages", [])):
-            raise Exception(f"lean-repl returned some errors: {repl_data["messages"]}")
+        # Don't reject the whole file for errors — let valid compilation units
+        # through. Errors in individual theorems will be caught per-tactic
+        # during proof tree replay and stored as error nodes.
         data = {
             "proof_tree_edges": repl_data["proofTreeEdges"],
             "info_trees": repl_data["infotree"],

@@ -297,47 +297,121 @@ class ProofTreePostprocessor:
         child_node = SingletonProofTreeNode.create_synthetic(parent=node, tactic=child_edge)
         node.tactic.spawned_goals.append(child_node)
 
-    # Closing delimiters that belong to a parent expression, not the nested tactic.
-    # The span extension must stop before these characters.
-    _CLOSING_DELIMITERS = set(')}]⟩»')
+    # Opening/closing bracket pairs for balanced scanning.
+    _OPEN_BRACKETS = set('([{⟨«')
+    _CLOSE_BRACKETS = set(')]}⟩»')
+    _BRACKET_PAIRS = {'(': ')', '[': ']', '{': '}', '⟨': '⟩', '«': '»'}
+
+    @classmethod
+    def _find_tactic_end(cls, text: str, start: int) -> int:
+        """Find the end of a tactic starting at ``start``.
+
+        Uses two rules that mirror Lean's whitespace-sensitive parser:
+
+        1. **Same line**: scan forward tracking bracket depth. The tactic
+           extends through balanced brackets but stops at an unmatched
+           closing bracket (which belongs to the parent expression) or a
+           comma at depth 0 (sibling in a tuple/anonymous constructor).
+        2. **Continuation lines**: subsequent lines that are indented
+           strictly further than the start column are part of the same
+           tactic.
+        """
+        line_start = text.rfind('\n', 0, start) + 1
+        start_col = start - line_start
+
+        # --- Phase 1: scan the first line with bracket tracking ---
+        first_nl = text.find('\n', start)
+        if first_nl == -1:
+            first_nl = len(text)
+
+        depth = 0
+        end = start
+        while end < first_nl:
+            ch = text[end]
+            if ch in cls._OPEN_BRACKETS:
+                depth += 1
+            elif ch in cls._CLOSE_BRACKETS:
+                if depth > 0:
+                    depth -= 1
+                else:
+                    # Unmatched close bracket — belongs to parent.
+                    break
+            elif ch == ',' and depth == 0:
+                # Comma at top level — sibling argument, not our tactic.
+                break
+            end += 1
+
+        # If we have open brackets, the tactic must continue on the next
+        # line(s) to close them.  Fall through to phase 2 in that case.
+        if depth == 0:
+            return len(text[start:end].rstrip()) + start
+
+        # We stopped at end-of-first-line with open brackets.
+        end = first_nl + 1
+
+        # --- Phase 2: consume indented continuation lines ---
+        while end < len(text):
+            next_nl = text.find('\n', end)
+            if next_nl == -1:
+                next_nl = len(text)
+            line = text[end:next_nl]
+            stripped = line.lstrip(' ')
+            if stripped == '' or stripped == '\n':
+                end = next_nl + 1
+                continue
+            line_indent = len(line) - len(stripped)
+            if line_indent <= start_col:
+                break
+            end = next_nl + 1
+        return len(text[:end].rstrip())
 
     @classmethod
     def _extend_spans_for_trailing_content(cls, sub_spans: list[FileSpan], tactic_string: str) -> list[FileSpan]:
-        """Extend sub_spans to cover trailing content up to the next sub_span boundary.
+        """Extend sub_spans to cover trailing content that the REPL's span missed.
 
-        When the REPL reports a tactic span that doesn't include trailing arguments
-        or continuation lines (e.g. `simpa [...] using` without `hpd3`, or
-        `induction h with` without `| refl => ...`), the uncovered text survives
-        sorry-replacement. This extends each sub_span to the boundary of the next
-        sub_span (or end of tactic string), consuming any trailing content that
-        would otherwise be left as dangling text after `sorry`.
+        Two strategies, applied per-span — whichever extends further wins:
 
-        However, closing delimiters like `)`, `⟩`, `]` belong to the parent
-        expression and must not be consumed.
+        1. **Indentation/bracket lookahead** (``_find_tactic_end``): handles
+           multi-line tactics where the REPL span covers only the first line
+           (e.g. ``nlinarith [arg1,\\n  arg2]``).
+        2. **Gap consumption**: extends to the next span boundary, stopping at
+           closing delimiters.  This handles structural gaps like
+           ``| refl =>`` between ``induction h with`` and the first case body.
         """
         result = []
         sorted_spans = sorted(sub_spans, key=lambda s: s.start)
         for i, span in enumerate(sorted_spans):
-            # Find the end boundary: either the start of the next span or end of string
+            # Upper boundary: don't extend past the start of the next span.
             if i + 1 < len(sorted_spans):
                 boundary = sorted_spans[i + 1].start.offset
             else:
                 boundary = len(tactic_string)
-            # Check if there's non-whitespace content between this span's end and boundary
+
+            # Strategy 1: indentation/bracket-based tactic end.
+            indent_end = min(cls._find_tactic_end(tactic_string, span.start.offset), boundary)
+
+            # Strategy 2: gap consumption — extend to boundary, but only stop
+            # at a closing bracket that is unmatched (belongs to the parent).
+            gap_end = span.finish.offset
             trailing = tactic_string[span.finish.offset:boundary]
             stripped = trailing.strip()
-            if stripped and stripped[0] not in cls._CLOSING_DELIMITERS:
-                # Extend to cover trailing tactic arguments, but stop before any
-                # closing delimiter that belongs to the parent expression.
-                extend_to = boundary
+            if stripped and stripped[0] not in cls._CLOSE_BRACKETS:
+                depth = 0
+                gap_end = boundary
                 for j in range(span.finish.offset, boundary):
-                    if tactic_string[j] in cls._CLOSING_DELIMITERS:
-                        extend_to = j
-                        break
-                if extend_to > span.finish.offset:
-                    result.append(FileSpan(span.start, FilePosition(extend_to)))
-                else:
-                    result.append(span)
+                    ch = tactic_string[j]
+                    if ch in cls._OPEN_BRACKETS:
+                        depth += 1
+                    elif ch in cls._CLOSE_BRACKETS:
+                        if depth > 0:
+                            depth -= 1
+                        else:
+                            gap_end = j
+                            break
+
+            new_end = max(indent_end, gap_end)
+            if new_end > span.finish.offset:
+                result.append(FileSpan(span.start, FilePosition(new_end)))
             else:
                 result.append(span)
         return result

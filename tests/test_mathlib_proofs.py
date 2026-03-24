@@ -40,6 +40,7 @@ TEST_FILES = {
     "explicit_sorry": "LeantreeProject/TestExplicitSorry.lean",
     "semantic_errors": "LeantreeProject/TestSemanticErrors.lean",
     "syntax_errors": "LeantreeProject/TestSyntaxErrors.lean",
+    "multiline_errors": "LeantreeProject/TestIMOProofP5.lean",
 }
 
 # Expected theorem counts per file
@@ -59,6 +60,7 @@ EXPECTED_THEOREMS = {
     "explicit_sorry": 3,  # add_zero_right, full_sorry, have_sorry
     "semantic_errors": 4,
     "syntax_errors": 4,
+    "multiline_errors": 1,
 }
 
 
@@ -363,3 +365,45 @@ def test_syntax_errors(project):
     assert any("mul_comn" in e.error for e in error_edges), (
         f"Expected error about 'mul_comn', got: {[e.error for e in error_edges]}"
     )
+
+
+def test_multiline_errors(project):
+    """Test multi-line tactic error handling (IMO-style proof with 3 errors).
+
+    Lean compiler reports:
+    1. Line 12: nlinarith failed (multi-line tactic with continuation args)
+    2. Line 33: unsolved goals after rw
+    3. Line 43: type mismatch (Eq.symm wrong direction)
+
+    The single theorem should produce a partial tree with errors.
+    """
+    theorems = load_and_check(project, "multiline_errors")
+
+    thm = theorems[0]
+    assert len(thm.by_blocks) > 0
+    block = thm.by_blocks[0]
+    assert isinstance(block.tree, ProofTree), (
+        f"Expected ProofTree, got {type(block.tree)}"
+    )
+    assert block.tree.has_error(), "Expected errors in tree"
+    assert not block.tree.is_solved(), "Expected unsolved tree due to errors"
+
+    # Tree should have substantial expansion (not just root + error)
+    nodes = block.tree.get_nodes()
+    assert len(nodes) > 5, (
+        f"Expected substantial tree expansion, got only {len(nodes)} nodes"
+    )
+
+    # Should have multiple error edges
+    error_edges = [
+        n.tactic for n in nodes
+        if n.tactic is not None and n.tactic.error is not None
+    ]
+    assert len(error_edges) >= 2, (
+        f"Expected at least 2 error edges (Lean has 3 errors), got {len(error_edges)}"
+    )
+
+    print(f"\n{'='*60}")
+    print(f"  imo_1968_p5_1 - PARTIAL TREE WITH {len(error_edges)} ERRORS")
+    print(f"{'='*60}")
+    print(block.tree.pretty_print())

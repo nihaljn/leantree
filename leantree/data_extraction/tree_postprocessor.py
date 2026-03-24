@@ -28,6 +28,7 @@ class ProofTreePostprocessor:
             ))
 
         cls._merge_intro_arguments(tree)
+        cls._fill_uncovered_leaf_tactics(tree)
         cls._add_missing_assumption_tactics(tree)
         cls._fix_incomplete_using_clause(tree, source_text)
         tree.traverse_preorder(visitor)
@@ -93,6 +94,79 @@ class ProofTreePostprocessor:
                     break
 
         tree.traverse_preorder(visitor)
+
+    @classmethod
+    def _fill_uncovered_leaf_tactics(cls, tree: SingletonProofTree):
+        """Fill in tactic text for leaf nodes from uncovered parent tactic text.
+
+        When a tactic fails (e.g. nlinarith on a false goal), the REPL omits it
+        from proofTreeEdges, leaving a leaf with no tactic.  But the parent chain
+        node's tactic string still has the full proof text including the failed
+        tactic.  This method extracts that uncovered text and assigns it to the
+        leaf so the tree builder can replay (and error-report) it.
+        """
+
+        def visitor(node: SingletonProofTreeNode):
+            if node.tactic is None or node.tactic.span is None:
+                return
+            for spawned in node.tactic.spawned_goals:
+                cls._fill_spawned_leaves(node, spawned)
+
+        tree.traverse_preorder(visitor)
+
+    @classmethod
+    def _fill_spawned_leaves(cls, chain_node: SingletonProofTreeNode,
+                             spawned_root: SingletonProofTreeNode):
+        """For a spawned goal subtree, find leaves and fill from uncovered text."""
+        # Collect leaves (nodes with no tactic)
+        leaves = []
+
+        def collect_leaves(n):
+            if n.tactic is None:
+                leaves.append(n)
+                return
+            for c in n.tactic.goals_after + n.tactic.spawned_goals:
+                collect_leaves(c)
+
+        collect_leaves(spawned_root)
+        if not leaves or len(leaves) != 1:
+            # Only handle single-leaf case to avoid ambiguity
+            return
+
+        chain_span = chain_node.tactic.span
+        if chain_span is None:
+            return
+
+        # Find the maximum span offset covered by edges in the spawned subtree
+        max_offset = 0
+
+        def find_max_offset(n):
+            nonlocal max_offset
+            if n.tactic and n.tactic.span and not n.tactic.is_synthetic():
+                end = n.tactic.span.finish.offset
+                if end > max_offset:
+                    max_offset = end
+            if n.tactic:
+                for c in n.tactic.goals_after + n.tactic.spawned_goals:
+                    find_max_offset(c)
+
+        find_max_offset(spawned_root)
+        if max_offset <= chain_span.start.offset:
+            return
+
+        # Extract uncovered text from the chain node's tactic string
+        rel_offset = max_offset - chain_span.start.offset
+        uncovered = chain_node.tactic.tactic_string[rel_offset:].strip()
+        if not uncovered:
+            return
+
+        leaf = leaves[0]
+        leaf.set_edge(SingletonProofTreeEdge.create_synthetic(
+            tactic_string=uncovered,
+            goal_before=leaf.goal,
+            spawned_goals=[],
+            goals_after=[],
+        ))
 
     @classmethod
     def _add_missing_assumption_tactics(cls, tree: SingletonProofTree):

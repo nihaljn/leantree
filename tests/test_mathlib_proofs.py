@@ -372,8 +372,8 @@ def test_multiline_errors(project):
 
     Lean compiler reports:
     1. Line 12: nlinarith failed (multi-line tactic with continuation args)
-    2. Line 33: unsolved goals after rw
-    3. Line 43: type mismatch (Eq.symm wrong direction)
+    2. Line 33: unsolved goals after rw (h_f3a_eq_fa)
+    3. Line 43: type mismatch (this.symm wrong direction)
 
     The single theorem should produce a partial tree with errors.
     """
@@ -394,16 +394,51 @@ def test_multiline_errors(project):
         f"Expected substantial tree expansion, got only {len(nodes)} nodes"
     )
 
-    # Should have multiple error edges
+    # Collect all error edges
     error_edges = [
         n.tactic for n in nodes
         if n.tactic is not None and n.tactic.error is not None
     ]
-    assert len(error_edges) >= 2, (
-        f"Expected at least 2 error edges (Lean has 3 errors), got {len(error_edges)}"
+    error_texts = [e.error for e in error_edges]
+
+    # Lean reports 3 errors. Check which ones leantree captures.
+    # Error 1: nlinarith/linarith failed (line 12, multi-line tactic)
+    has_nlinarith_error = any(
+        "linarith" in err.lower() or "nlinarith" in err.lower()
+        for err in error_texts
     )
+    # Error 2: unsolved goals after rw in h_f3a_eq_fa (line 33)
+    # Lean reports "unsolved goals" but leantree sees it as the synthetic
+    # `assumption` tactic failing on the remaining goal after the rw chain.
+    has_unsolved_goals_error = any(
+        "unsolved" in err.lower() or "assumption" in err.lower()
+        for err in error_texts
+    )
+    # Error 3: type mismatch from this.symm (line 43)
+    has_type_mismatch_error = any(
+        "type mismatch" in err.lower() or "mismatch" in err.lower()
+        for err in error_texts
+    )
+
+    captured = sum([has_nlinarith_error, has_unsolved_goals_error, has_type_mismatch_error])
 
     print(f"\n{'='*60}")
     print(f"  imo_1968_p5_1 - PARTIAL TREE WITH {len(error_edges)} ERRORS")
+    print(f"  Captured {captured}/3 Lean errors:")
+    print(f"    nlinarith failed:   {'YES' if has_nlinarith_error else 'NO'}")
+    print(f"    unsolved goals:     {'YES' if has_unsolved_goals_error else 'NO'}")
+    print(f"    type mismatch:      {'YES' if has_type_mismatch_error else 'NO'}")
+    print(f"  All error texts: {error_texts}")
     print(f"{'='*60}")
     print(block.tree.pretty_print())
+
+    # All 3 Lean compiler errors must be captured
+    assert has_nlinarith_error, (
+        f"Missing nlinarith/linarith error (line 12). Errors: {error_texts}"
+    )
+    assert has_unsolved_goals_error, (
+        f"Missing unsolved goals error (line 33). Errors: {error_texts}"
+    )
+    assert has_type_mismatch_error, (
+        f"Missing type mismatch error (line 43). Errors: {error_texts}"
+    )

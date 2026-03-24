@@ -115,11 +115,13 @@ class FileSpan:
         result = []
         for span in spans[1:]:
             if span.start <= curr_span.finish:
-                curr_span = FileSpan(curr_span.start, span.finish)
+                new_finish = max(curr_span.finish, span.finish, key=lambda p: p.offset)
+                curr_span = FileSpan(curr_span.start, new_finish)
                 continue
             inbetween = FileSpan(curr_span.finish, span.start).read_from_string(content)
             if should_merge(inbetween):
-                curr_span = FileSpan(curr_span.start, span.finish)
+                new_finish = max(curr_span.finish, span.finish, key=lambda p: p.offset)
+                curr_span = FileSpan(curr_span.start, new_finish)
             else:
                 result.append(curr_span)
                 curr_span = span
